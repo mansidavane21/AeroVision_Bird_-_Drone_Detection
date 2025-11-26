@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.env
+.env/
+venv/
+*.egg-info/
+*.swp
+
+# PyTorch / Models
+*.pth
+*.pt
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Dataset (optional, if large)
+data/
+
+# VSCode / IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
