@@ -1,235 +1,224 @@
-import io
 import streamlit as st
+import cv2
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+import io
+import tempfile
 import torch
 from torchvision import transforms, models
 from ultralytics import YOLO
-import numpy as np
+import pandas as pd
 
 # -------------------------
-# Helper functions
+# PAGE LAYOUT & HEADER
 # -------------------------
-def xyxy_to_int(xyxy):
-    return [int(x) for x in xyxy]
+st.set_page_config(page_title="AeroVision – Bird & Drone Detection", layout="wide")
+
+st.markdown("""
+<style>
+.main-title { font-size:50px; font-weight:900; text-align:center; margin-bottom:-10px;}
+.subtitle { text-align:center; font-size:18px; color:#555; margin-bottom:30px;}
+.section-title { font-size:26px; font-weight:700; margin-top:20px; color:#333;}
+.feature-box { background-color:#f3f6ff; padding:20px; border-radius:12px; margin-bottom:25px; border-left:4px solid #5a8dee;}
+.top-buttons { display:flex; justify-content:center; gap:20px; margin-bottom:20px;}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("<h1 class='main-title'>🦅 AeroVision – Bird & Drone Detection</h1>", unsafe_allow_html=True)
+st.markdown("<p class='subtitle'>AI-powered real-time system for detecting Birds, Drones & Humans</p>", unsafe_allow_html=True)
+
+# -------------------------
+# PROJECT OVERVIEW & FEATURES
+# -------------------------
+st.markdown("<h2 class='section-title'>📘 Project Overview</h2>", unsafe_allow_html=True)
+st.markdown("""
+<div class='feature-box'>
+AeroVision detects Birds, Drones, and Persons using:<br><br>
+✔ <b>YOLOv8 Object Detection</b><br>
+✔ <b>ResNet-50 Classifier (optional)</b><br>
+✔ Image & Video Upload Detection<br>
+✔ Bounding Boxes with Confidence<br>
+✔ Summary Table & Download Options<br>
+Ideal for <b>security, wildlife monitoring, hazard management, and airspace safety</b>.
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown("<h2 class='section-title'>🚀 Key Features</h2>", unsafe_allow_html=True)
+st.markdown("""
+<div class='feature-box'>
+🔹 Image & Video Upload Detection<br>
+🔹 Advanced YOLOv8 Model<br>
+🔹 ResNet-50 Classifier (optional)<br>
+🔹 Smart Person Filtering<br>
+🔹 Clean UI & Download Options<br>
+🔹 Summary Table with Confidences<br>
+🔹 No Coding Required
+</div>
+""", unsafe_allow_html=True)
+
+# -------------------------
+# INPUT CONTROLS
+# -------------------------
+st.markdown('<div class="top-buttons">', unsafe_allow_html=True)
+
+input_type = st.radio("Input Type:", ["Upload Image", "Upload Video"], index=0, horizontal=True)
+use_classifier = st.checkbox("Use ResNet Classifier", value=True)
+yolo_thresh = st.slider("YOLO Confidence Threshold", 0.0, 1.0, 0.3, 0.05)
+
+uploaded_file = None
+if input_type == "Upload Image":
+    uploaded_file = st.file_uploader("Upload Image", type=["jpg","jpeg","png"])
+elif input_type == "Upload Video":
+    uploaded_file = st.file_uploader("Upload Video", type=["mp4","avi","mov"])
+
+st.markdown('</div>', unsafe_allow_html=True)
+
+# -------------------------
+# HELPER FUNCTIONS
+# -------------------------
+def xyxy_to_int(xyxy): return [int(x) for x in xyxy]
 
 def iou(boxA, boxB):
-    # boxes in [x1, y1, x2, y2]
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
+    xA, yA = max(boxA[0], boxB[0]), max(boxA[1], boxB[1])
+    xB, yB = min(boxA[2], boxB[2]), min(boxA[3], boxB[3])
+    interArea = max(0, xB-xA) * max(0, yB-yA)
+    if interArea == 0: return 0.0
+    boxAArea = (boxA[2]-boxA[0]) * (boxA[3]-boxA[1])
+    boxBArea = (boxB[2]-boxB[0]) * (boxB[3]-boxB[1])
+    return interArea / float(boxAArea + boxBArea - interArea)
 
-    interW = max(0, xB - xA)
-    interH = max(0, yB - yA)
-    interArea = interW * interH
-    if interArea == 0:
-        return 0.0
-    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
-    iou_val = interArea / float(boxAArea + boxBArea - interArea)
-    return iou_val
+def draw_label(draw, box, text, font, rect_color=(0,255,0)):
+    x1,y1,x2,y2 = box
+    try: text_bbox = draw.textbbox((x1,y1), text, font=font)
+    except: text_bbox = draw.textbbox((0,0), text, font=font)
+    tw,th = text_bbox[2]-text_bbox[0], text_bbox[3]-text_bbox[1]
+    padding=4
+    bx1,by1 = x1,y1-th-padding*2
+    bx2,by2 = x1+tw+padding*2,y1
+    draw.rectangle([bx1,by1,bx2,by2], fill=rect_color)
+    draw.text((bx1+padding,by1+padding), text, fill=(255,255,255), font=font)
 
-def draw_label(draw, box, text, font, rect_color=(0, 255, 0)):
-    x1, y1, x2, y2 = box
-
-    # Use textbbox to compute text width/height (compatible with Pillow 10+)
-    try:
-        text_bbox = draw.textbbox((x1, y1), text, font=font)
-    except Exception:
-        # fallback - measure at origin
-        text_bbox = draw.textbbox((0, 0), text, font=font)
-    text_width = text_bbox[2] - text_bbox[0]
-    text_height = text_bbox[3] - text_bbox[1]
-
-    padding = 4
-    # Background rectangle for text - prefer above the box if space
-    bg_x1 = x1
-    bg_x2 = x1 + text_width + 2 * padding
-    bg_y2 = y1
-    bg_y1 = y1 - (text_height + 2 * padding)
-    if bg_y1 < 0:
-        # not enough space above, place inside box top
-        bg_y1 = y1
-        bg_y2 = y1 + text_height + 2 * padding
-
-    draw.rectangle((bg_x1, bg_y1, bg_x2, bg_y2), fill=rect_color)
-    text_x = bg_x1 + padding
-    text_y = bg_y1 + padding
-    draw.text((text_x, text_y), text, fill=(255, 255, 255), font=font)
-
-# -------------------------
-# Model & device setup
-# -------------------------
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# COCO pretrained YOLO to detect people and generic objects
-coco_model = YOLO("yolov8n.pt")  # ensure this file is available in working dir or path
-
-# Your custom YOLO trained for Bird/Drone
-custom_yolo = YOLO("yolov8/yolov8_best.pt")  # path to your custom weights
-
-# ResNet50 classifier (Bird / Drone)
-model = models.resnet50(pretrained=False)
-num_classes = 2
-model.fc = torch.nn.Linear(model.fc.in_features, num_classes)
-
-state_dict = torch.load("models/resnet50_best.pth", map_location=device)
-model.load_state_dict(state_dict)
-model.to(device)
-model.eval()
-
-# Preprocess for ResNet
-preprocess = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225])
-])
-classes = ['Bird', 'Drone']
-
-# Streamlit UI
-st.title("AeroVision: Bird & Drone Detection")
-
-uploaded_file = st.file_uploader("Upload an image", type=['jpg', 'jpeg', 'png'])
-
-if uploaded_file:
-    image = Image.open(uploaded_file).convert("RGB")
-    st.write("**Original image:**")
-    st.image(image, use_container_width=True)
-
-    # Run COCO model first to detect people (class 0 in COCO = person)
-    coco_results = coco_model(image)
-    coco_boxes = []
-    try:
-        coco_box_objs = coco_results[0].boxes
-        # robust access: work whether boxes.xyx y or boxes.xyxy present
-        for i, b in enumerate(coco_box_objs):
-            # class id and conf
-            cls_idx = int(b.cls[0].item()) if hasattr(b, "cls") else int(b.cls)
-            conf = float(b.conf[0].item()) if hasattr(b, "conf") else float(b.conf)
-            # xy coordinates
-            if hasattr(coco_box_objs, "xyxy"):
-                xy = coco_box_objs.xyxy[i].tolist()
-            elif hasattr(b, "xyxy"):
-                xy = b.xyxy[0].tolist()
-            else:
-                # fallback, try b.xyxy
-                xy = [float(x) for x in b.xyxy]
-            # capture person boxes only
-            if cls_idx == 0:
-                coco_boxes.append([int(xy[0]), int(xy[1]), int(xy[2]), int(xy[3])])
-    except Exception:
-        # if something odd happens, just continue with empty person list
-        coco_boxes = []
-
-    # Run custom YOLO for bird/drone detection
-    custom_results = custom_yolo(image)
-    detections = []  # will hold dicts: {xy, yolo_conf, yolo_cls, cls_label, cls_conf, overlap_person}
-    try:
-        custom_box_objs = custom_results[0].boxes
-        for i, b in enumerate(custom_box_objs):
-            # xy
-            if hasattr(custom_box_objs, "xyxy"):
-                xy = custom_box_objs.xyxy[i].tolist()
-            elif hasattr(b, "xyxy"):
-                xy = b.xyxy[0].tolist()
-            else:
-                xy = [float(x) for x in b.xyxy]
-            x1, y1, x2, y2 = map(int, xy)
-            # conf and cls
-            yolo_conf = float(custom_box_objs.conf[i].item()) if hasattr(custom_box_objs, "conf") else (float(b.conf[0].item()) if hasattr(b, "conf") else float(b.conf))
-            yolo_cls = int(custom_box_objs.cls[i].item()) if hasattr(custom_box_objs, "cls") else (int(b.cls[0].item()) if hasattr(b, "cls") else int(b.cls))
-
-            # Check overlap with any detected person box (IoU > threshold => skip)
-            overlap_person = False
-            for pbox in coco_boxes:
-                if iou([x1, y1, x2, y2], pbox) > 0.3:
-                    overlap_person = True
-                    break
-
-            cls_label = None
-            cls_conf = None
-
-            if overlap_person:
-                cls_label = "Person (skipped)"
-                cls_conf = 0.0
-            else:
-                # Crop and classify with ResNet
-                cropped = image.crop((x1, y1, x2, y2)).convert("RGB")
-                inp = preprocess(cropped).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    out = model(inp)
-                    probs = torch.softmax(out, dim=1)[0]
-                    top_conf, top_idx = torch.max(probs, dim=0)
-                    cls_label = classes[int(top_idx)]
-                    cls_conf = float(top_conf.item())
-
-            detections.append({
-                "xy": [x1, y1, x2, y2],
-                "yolo_conf": yolo_conf,
-                "yolo_cls": yolo_cls,
-                "cls_label": cls_label,
-                "cls_conf": cls_conf,
-                "overlap_person": overlap_person
-            })
-    except Exception:
-        # no detections or unexpected structure
-        detections = []
-
-    # Build annotated image
-    annotated = image.copy()
-    draw = ImageDraw.Draw(annotated)
-    try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", size=16)
-    except Exception:
-        font = ImageFont.load_default()
-
-    for idx, det in enumerate(detections):
-        x1, y1, x2, y2 = det["xy"]
+def create_summary_table(detections):
+    data=[]
+    for i, det in enumerate(detections):
         if det["overlap_person"]:
-            label_text = "Person (skipped)"
-            box_color = (255, 165, 0)  # orange for skipped
+            data.append([i+1,"Person (skipped)",0.0,det["yolo_conf"]])
         else:
-            cls_conf_pct = det["cls_conf"] * 100 if det["cls_conf"] is not None else 0.0
-            label_text = f"{det['cls_label']} ({cls_conf_pct:.0f}%)"
-            box_color = (0, 255, 0)  # green for positive detection
+            data.append([i+1,det["cls_label"],det["cls_conf"],det["yolo_conf"]])
+    return pd.DataFrame(data, columns=["Object #","Class","Classifier Conf","YOLO Conf"])
 
-        # Draw bounding box and label
-        draw.rectangle([x1, y1, x2, y2], outline=box_color, width=3)
-        draw_label(draw, (x1, y1, x2, y2), label_text, font, rect_color=box_color)
+def detect_and_annotate(img_pil):
+    # YOLO detection
+    coco_results = coco_model(img_pil)
+    person_boxes=[]
+    try:
+        for b in coco_results[0].boxes:
+            cls_idx=int(b.cls[0])
+            conf=float(b.conf[0])
+            if cls_idx==0 and conf>=yolo_thresh:
+                person_boxes.append(xyxy_to_int(b.xyxy[0]))
+    except: pass
 
-        # Small YOLO confidence below the box - using textbbox instead of textsize
-        yolo_conf_pct = det["yolo_conf"] * 100
-        small_text = f"yolo:{yolo_conf_pct:.0f}%"
-        small_text_x = x1
-        small_text_y = y2 + 4
-        # compute bbox for small text
-        try:
-            small_bbox = draw.textbbox((small_text_x, small_text_y), small_text, font=font)
-        except Exception:
-            small_bbox = draw.textbbox((0, 0), small_text, font=font)
-        small_w = small_bbox[2] - small_bbox[0]
-        small_h = small_bbox[3] - small_bbox[1]
-        draw.rectangle([small_text_x, small_text_y, small_text_x + small_w + 6, small_text_y + small_h + 6], fill=(0, 0, 0))
-        draw.text((small_text_x + 3, small_text_y + 3), small_text, fill=(255, 255, 255), font=font)
+    results=custom_yolo(img_pil)
+    detections=[]
+    for b in results[0].boxes:
+        xy=xyxy_to_int(b.xyxy[0])
+        x1,y1,x2,y2=xy
+        yolo_conf=float(b.conf[0])
+        if yolo_conf<yolo_thresh: continue
+        overlap_person=any(iou(xy,p)>0.3 for p in person_boxes)
+        cls_label="Person (skipped)" if overlap_person else results[0].names[int(b.cls[0])]
+        cls_conf=0.0 if overlap_person else float(b.conf[0])
+        if use_classifier and not overlap_person:
+            cropped=img_pil.crop((x1,y1,x2,y2))
+            inp=preprocess(cropped).unsqueeze(0).to(device)
+            with torch.no_grad():
+                out=classifier_model(inp)
+                probs=torch.softmax(out,dim=1)[0]
+                cls_conf_val, idx=torch.max(probs,dim=0)
+                cls_label = classes[idx]
+                cls_conf = float(cls_conf_val.item())
+        detections.append({"xy":xy,"yolo_conf":yolo_conf,"cls_label":cls_label,"cls_conf":cls_conf,"overlap_person":overlap_person})
 
-    # Show final annotated image
-    st.write("### Final annotated image (detection + classification):")
-    st.image(annotated, use_container_width=True)
+    annotated=img_pil.copy()
+    draw=ImageDraw.Draw(annotated)
+    font=ImageFont.load_default()
+    for det in detections:
+        x1,y1,x2,y2=det["xy"]
+        label=det["cls_label"]
+        conf=det["cls_conf"]
+        color=(255,165,0) if det["overlap_person"] else (0,255,0)
+        draw.rectangle([x1,y1,x2,y2], outline=color, width=3)
+        display=f"{label} ({conf*100:.0f}%)" if conf is not None else label
+        draw_label(draw,[x1,y1,x2,y2],display,font,color)
+    return annotated, create_summary_table(detections)
 
-    # Also show a simple detections table / summary
-    st.write("### Detections summary:")
-    if len(detections) == 0:
-        st.write("No bird/drone detections found.")
-    else:
-        for i, det in enumerate(detections):
-            if det["overlap_person"]:
-                st.write(f"• Object {i+1}: Person overlap detected — skipped classification (YOLO conf: {det['yolo_conf']:.2f})")
-            else:
-                st.write(f"• Object {i+1}: {det['cls_label']} — classifier conf: {det['cls_conf']:.2f}, YOLO conf: {det['yolo_conf']:.2f}")
+# -------------------------
+# LOAD MODELS
+# -------------------------
+@st.cache_resource
+def load_models():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    coco = YOLO("yolov8n.pt")
+    custom = YOLO("yolov8/yolov8_best.pt")
+    classifier = models.resnet50(pretrained=False)
+    classifier.fc = torch.nn.Linear(classifier.fc.in_features, 2)
+    state = torch.load("models/resnet50_best.pth", map_location=device)
+    classifier.load_state_dict(state)
+    classifier.to(device).eval()
+    preprocess = transforms.Compose([
+        transforms.Resize((224,224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+    ])
+    classes = ["Bird","Drone"]
+    return device, coco, custom, classifier, preprocess, classes
 
-    # Optional: provide download link for annotated image
-    buf = io.BytesIO()
-    annotated.save(buf, format="PNG")
-    buf.seek(0)
-    st.download_button("Download annotated image", data=buf, file_name="annotated.png", mime="image/png")
+device, coco_model, custom_yolo, classifier_model, preprocess, classes = load_models()
+
+# -------------------------
+# IMAGE DETECTION
+# -------------------------
+if input_type == "Upload Image" and uploaded_file is not None:
+    img = Image.open(uploaded_file).convert("RGB")
+    st.image(img, caption="Uploaded Image", use_container_width=True)
+    annotated_img, summary_df = detect_and_annotate(img)
+    st.image(annotated_img, caption="Annotated Image", use_container_width=True)
+    buf=io.BytesIO()
+    annotated_img.save(buf, format="PNG"); buf.seek(0)
+    st.download_button("Download Annotated Image", buf, "annotated.png")
+    st.write("### 📊 Detection Summary")
+    st.dataframe(summary_df)
+
+# -------------------------
+# VIDEO DETECTION
+# -------------------------
+if input_type == "Upload Video" and uploaded_file is not None:
+    tfile = tempfile.NamedTemporaryFile(delete=False)
+    tfile.write(uploaded_file.read())
+    cap = cv2.VideoCapture(tfile.name)
+    frames = []
+    all_detections = []
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        annotated_frame, summary_df = detect_and_annotate(img_pil)
+        frames.append(np.array(annotated_frame))
+        all_detections.extend(summary_df.to_dict('records'))
+    cap.release()
+
+    # Save annotated video
+    temp_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    h, w, _ = frames[0].shape
+    out = cv2.VideoWriter(temp_video.name, cv2.VideoWriter_fourcc(*"mp4v"), 20, (w, h))
+    for f in frames:
+        out.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+    out.release()
+
+    st.success("🎉 Video processed successfully!")
+    st.video(temp_video.name)
+    st.write("### 📊 Detection Summary")
+    st.dataframe(pd.DataFrame(all_detections))
